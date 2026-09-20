@@ -53,10 +53,12 @@ class Transformer(private val map: MappingSet) {
 
     @Throws(IOException::class)
     fun remap(sources: Map<String, String>, processedSources: Map<String, String>): Map<String, Pair<String, List<Pair<Int, String>>>> {
+        val totalStart = System.nanoTime()
         val tmpDir = Files.createTempDirectory("remap")
         val processedTmpDir = Files.createTempDirectory("remap-processed")
         val disposable = Disposer.newDisposable()
         try {
+            val tempFilesStart = System.nanoTime()
             for ((unitName, source) in sources) {
                 val path = tmpDir.resolve(unitName)
                 Files.createDirectories(path.parent)
@@ -67,7 +69,9 @@ class Transformer(private val map: MappingSet) {
                 Files.createDirectories(processedPath.parent)
                 Files.write(processedPath, processedSource.toByteArray(), StandardOpenOption.CREATE)
             }
+            val tempFilesMillis = elapsedMillis(tempFilesStart)
 
+            val environmentStart = System.nanoTime()
             val config = CompilerConfiguration()
             config.put(CommonConfigurationKeys.MODULE_NAME, "main")
             jdkHome?.let {config.setupJdk(it) }
@@ -103,6 +107,7 @@ class Transformer(private val map: MappingSet) {
                     config,
                     EnvironmentConfigFiles.JVM_CONFIG_FILES
             )
+            val environmentMillis = elapsedMillis(environmentStart)
             @Suppress("DEPRECATION")
             val rootArea = Extensions.getRootArea()
             synchronized(rootArea) {
@@ -114,10 +119,13 @@ class Transformer(private val map: MappingSet) {
             val project = environment.project as MockProject
             val psiManager = PsiManager.getInstance(project)
             val vfs = VirtualFileManager.getInstance().getFileSystem(StandardFileSystems.FILE_PROTOCOL) as CoreLocalFileSystem
+            val psiFilesStart = System.nanoTime()
             val virtualFiles = sources.mapValues { vfs.findFileByIoFile(tmpDir.resolve(it.key).toFile())!! }
             val psiFiles = virtualFiles.mapValues { psiManager.findFile(it.value)!! }
             val ktFiles = psiFiles.values.filterIsInstance<KtFile>()
+            val psiFilesMillis = elapsedMillis(psiFilesStart)
 
+            val analysisStart = System.nanoTime()
             val analysis = try {
                 analyze1521(environment, ktFiles)
             } catch (e: NoSuchMethodError) {
@@ -127,11 +135,15 @@ class Transformer(private val map: MappingSet) {
                     analyze200(environment, ktFiles)
                 }
             }
+            val analysisMillis = elapsedMillis(analysisStart)
 
+            val remappedEnvironmentStart = System.nanoTime()
             val remappedEnv = remappedClasspath?.let {
                 setupRemappedProject(disposable, it, processedTmpDir)
             }
+            val remappedEnvironmentMillis = elapsedMillis(remappedEnvironmentStart)
 
+            val patternsStart = System.nanoTime()
             val patterns = patternAnnotation?.let { annotationFQN ->
                 val patterns = PsiPatterns(annotationFQN)
                 val annotationName = annotationFQN.substring(annotationFQN.lastIndexOf('.') + 1)
@@ -147,15 +159,22 @@ class Transformer(private val map: MappingSet) {
                 }
                 patterns
             }
+            val patternsMillis = elapsedMillis(patternsStart)
 
+            val autoImportsStart = System.nanoTime()
             val autoImports = if (manageImports && remappedEnv != null) {
                 AutoImports(remappedEnv)
             } else {
                 null
             }
+            val autoImportsMillis = elapsedMillis(autoImportsStart)
 
             val results = HashMap<String, Pair<String, List<Pair<Int, String>>>>()
+            val remapFilesStart = System.nanoTime()
+            var slowestFile: String? = null
+            var slowestFileMillis = 0L
             for (name in sources.keys) {
+                val fileStart = System.nanoTime()
                 val file = vfs.findFileByIoFile(tmpDir.resolve(name).toFile())!!
                 val psiFile = psiManager.findFile(file)!!
 
@@ -171,7 +190,22 @@ class Transformer(private val map: MappingSet) {
                 }
 
                 results[name] = text to errors
+                val fileMillis = elapsedMillis(fileStart)
+                if (fileMillis > slowestFileMillis) {
+                    slowestFile = name
+                    slowestFileMillis = fileMillis
+                }
             }
+            val remapFilesMillis = elapsedMillis(remapFilesStart)
+            System.err.println(
+                "[remap-timing] sources=${sources.size}, processed=${processedSources.size}, " +
+                    "kotlin=${ktFiles.size}, tempFiles=${tempFilesMillis}ms, " +
+                    "environment=${environmentMillis}ms, psiFiles=${psiFilesMillis}ms, " +
+                    "analysis=${analysisMillis}ms, remappedEnvironment=${remappedEnvironmentMillis}ms, " +
+                    "patterns=${patternsMillis}ms, autoImports=${autoImportsMillis}ms, " +
+                    "remapFiles=${remapFilesMillis}ms, slowest=${slowestFile ?: "<none>"}" +
+                    "(${slowestFileMillis}ms), total=${elapsedMillis(totalStart)}ms"
+            )
             return results
         } finally {
             Files.walk(tmpDir).sorted(Comparator.reverseOrder()).forEach { Files.delete(it) }
@@ -179,6 +213,8 @@ class Transformer(private val map: MappingSet) {
             Disposer.dispose(disposable)
         }
     }
+
+    private fun elapsedMillis(start: Long): Long = (System.nanoTime() - start) / 1_000_000
 
     private fun CompilerConfiguration.setupJdk(jdkHome: File) {
         put(JVMConfigurationKeys.JDK_HOME, jdkHome)
