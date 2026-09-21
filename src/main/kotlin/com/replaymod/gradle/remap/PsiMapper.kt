@@ -630,6 +630,13 @@ internal class PsiMapper(
                                 // If we have multiple such methods, but only one is a good match,
                                 // we need to include its descriptor.
                                 matchingMethods.single().desc
+                            } else if (targetDesc != null && matchingMethods.count { it.desc == targetDesc } == 1) {
+                                // The literal already spells out the *target* descriptor. That happens when a
+                                // preprocessor directive writes the new signature verbatim: the source class has
+                                // no such method, so targetMethod is null and the bare name is ambiguous against
+                                // the target's overloads. Re-remapping the descriptor cannot match anything in
+                                // that case, so keep it exactly as written.
+                                targetDesc
                             } else {
                                 // If there's multiple such methods, we need to include the descriptor.
                                 val mappedDesc = (targetMethod?.desc ?: targetDesc)?.let { remapMethodDesc(it) }
