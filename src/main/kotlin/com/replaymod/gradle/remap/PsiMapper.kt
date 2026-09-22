@@ -643,7 +643,11 @@ internal class PsiMapper(
                                     error(literalExpr,
                                         "Mixin target \"$targetName\" cannot be automatically remapped " +
                                                 "as there are multiple methods with the same remapped name: " +
-                                                mappedMethods.joinToString { "\"${it.name}${it.desc}\"" })
+                                                mappedMethods.joinToString { "\"${it.name}${it.desc}\"" } +
+                                                " [literal=$literalValue targetDesc=$targetDesc" +
+                                                " targetMethod=${targetMethod?.desc}" +
+                                                " targetClass=${targetClass.qualifiedName}" +
+                                                " matching=${matchingMethods.joinToString { it.desc }}]")
                                 }
                                 mappedDesc ?: ""
                             }
