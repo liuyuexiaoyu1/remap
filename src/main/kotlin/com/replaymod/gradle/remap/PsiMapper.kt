@@ -14,6 +14,7 @@ import org.jetbrains.kotlin.com.intellij.openapi.project.Project
 import org.jetbrains.kotlin.com.intellij.openapi.util.TextRange
 import org.jetbrains.kotlin.com.intellij.openapi.util.text.StringUtil
 import org.jetbrains.kotlin.com.intellij.psi.*
+import org.jetbrains.kotlin.com.intellij.psi.search.GlobalSearchScope
 import org.jetbrains.kotlin.com.intellij.psi.util.ClassUtil
 import org.jetbrains.kotlin.descriptors.CallableMemberDescriptor
 import org.jetbrains.kotlin.descriptors.FunctionDescriptor
@@ -355,6 +356,12 @@ internal class PsiMapper(
             if (mapping != null) {
                 val mapped = signatures.firstNotNullOfOrNull { mapping!!.findMethodMapping(it) }
                 if (mapped != null) {
+                    // If the original name still resolves on the target version, leave the call alone. A target
+                    // can gain an inherited method under the old name while its own method of that name gets
+                    // renamed: Registry.getOrThrow becomes getValueOrThrow (returning T) while
+                    // HolderGetter.getOrThrow keeps the name and returns a Holder. Rewriting the call would move
+                    // it onto a different method than the source meant to reach, which then fails to compile.
+                    if (mapped.deobfuscatedName != method.name && resolvesOnTarget(method)) return null
                     return mapped
                 }
                 mapping = null
@@ -376,6 +383,19 @@ internal class PsiMapper(
                 mapping = map.findClassMapping(name)
             }
         }
+    }
+
+    /**
+     * Whether the method's own name still resolves to a method on the target version. A renamed method can keep
+     * its name on an inherited declaration, in which case the call site means that inherited method and must not
+     * be rewritten to the class's renamed one.
+     */
+    private fun resolvesOnTarget(method: PsiMethod): Boolean {
+        val project = remappedProject ?: return false
+        val owner = method.containingClass?.qualifiedName ?: return false
+        val targetClass = JavaPsiFacade.getInstance(project).findClass(owner, GlobalSearchScope.allScope(project))
+            ?: return false
+        return targetClass.findMethodsByName(method.name, true).isNotEmpty()
     }
 
     private fun findExactMapping(declaringClass: PsiClass, name: String, desc: String): MethodMapping? {
