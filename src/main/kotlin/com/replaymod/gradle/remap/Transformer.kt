@@ -38,6 +38,13 @@ import java.util.*
 import kotlin.system.exitProcess
 
 // fallen's fork: optimize use physical source roots for PSI
+/**
+ * The class a `@Mixin` names, taken as a bare identifier. Only the simple name is needed: a class defined in
+ * this same source set is referred to by its simple name, and anything else resolves through the classpath,
+ * which the cache key already covers.
+ */
+private val MIXIN_TARGET = Regex("""@Mixin\s*\(\s*(?:value\s*=\s*)?\{?\s*([A-Za-z_]\w*)""")
+
 data class PhysicalSourceFile(
     val file: File,
     val sourceRoot: File,
@@ -54,6 +61,17 @@ class Transformer(private val map: MappingSet) {
     var enableMessageCollector = true
     var verboseCompilerMessages = false
 
+    /**
+     * Optional per-file result cache. Supplied by the caller so it can live in the consumer's build directory.
+     * The PSI environment still has to be built over every source file, but each file's rewrite is independent,
+     * so a file whose text and mapping are unchanged can reuse its previous output instead of being remapped
+     * again - which is where the bulk of the time goes when only a handful of files changed.
+     */
+    var remappedFileCacheDir: File? = null
+
+    /** Fingerprint of the mapping in use. Entries from different mappings must never be mixed. */
+    var remappedFileCacheKey: String? = null
+
     @Throws(IOException::class)
     fun remap(sources: Map<String, String>): Map<String, Pair<String, List<Pair<Int, String>>>> =
             remap(sources, emptyMap())
@@ -61,35 +79,101 @@ class Transformer(private val map: MappingSet) {
     @Throws(IOException::class)
     fun remap(sources: Map<String, String>, processedSources: Map<String, String>): Map<String, Pair<String, List<Pair<Int, String>>>> {
         // fallen's fork: optimize use physical source roots for PSI - extract common impl
+        return remapInternal(sources, { processedSources }, null)
+    }
+
+    /**
+     * Same as [remap], except that the preprocessed sources are produced on demand.
+     *
+     * They are only consulted once a rewrite actually runs, and a full cache hit never reaches that point, so a
+     * caller that would otherwise have to compute them up front can hand the work over instead.
+     */
+    @Throws(IOException::class)
+    fun remapOnDemand(sources: Map<String, String>, processedSources: () -> Map<String, String>): Map<String, Pair<String, List<Pair<Int, String>>>> {
         return remapInternal(sources, processedSources, null)
     }
 
     // fallen's fork: optimize use physical source roots for PSI - add PhysicalSourceFile variant
     @Throws(IOException::class)
     fun remapFromFiles(sources: Map<String, PhysicalSourceFile>, processedSources: Map<String, String>): Map<String, Pair<String, List<Pair<Int, String>>>> {
-        return remapInternal(sources.mapValues { it.value.sourceText }, processedSources, sources)
+        return remapInternal(sources.mapValues { it.value.sourceText }, { processedSources }, sources)
     }
 
     // fallen's fork: optimize use physical source roots for PSI - extract common impl
-    private fun remapInternal(sources: Map<String, String>, processedSources: Map<String, String>, physicalSourceFiles: Map<String, PhysicalSourceFile>?): Map<String, Pair<String, List<Pair<Int, String>>>> {
+    private fun remapInternal(sources: Map<String, String>, processedSourcesProvider: () -> Map<String, String>, physicalSourceFiles: Map<String, PhysicalSourceFile>?): Map<String, Pair<String, List<Pair<Int, String>>>> {
+        // The preprocessed sources are pure string work over the sources, and nothing on the replay path needs
+        // them, so they stay unevaluated until one of the few places below actually asks.
+        val processedSources by lazy(processedSourcesProvider)
+        // What the remapper parses as its PSI basis is the preprocessed text, not the raw sources: it reads
+        // annotation arguments out of whatever it is handed, and a directive may already have swapped in the
+        // alternative this version needs. Files the preprocessing left alone fall back to their raw text.
+        val psiSources by lazy { sources.mapValues { (name, text) -> processedSources[name] ?: text } }
+        // If every source is already cached then there is nothing to analyse, and the PSI environment - by far
+        // the most expensive part of this method - does not need to be built at all. The cache key covers the
+        // entire source set and the settings, so a full hit means the previous result for exactly this input is
+        // still valid; the per-file loop below would only read the same files back.
+        val cacheDir = remappedFileCacheDir
+        val cacheKey = remappedFileCacheKey
+        // The only thing a file's rewrite takes from *other* sources is the class it names in `@Mixin`: when
+        // that class lives in a dependency, its structure is already covered by the classpath part of the key,
+        // and when it is defined here it is a real cross-file input. Fold in exactly those targets, so a file
+        // whose targets did not move keeps its previous result while the ones that did get rewritten. Pattern
+        // annotations and Kotlin scope are whole-set inputs by nature, so when either is in play the whole set
+        // is folded into every file's key.
+        val sourceClassByName = HashMap<String, String>()
+        for (path in sources.keys) {
+            val simple = path.substringAfterLast('/').substringBeforeLast('.')
+            if (simple.isNotEmpty()) sourceClassByName.putIfAbsent(simple, path)
+        }
+        val setWideDependencies = HashSet<String>()
+        patternAnnotation?.let { annotation ->
+            val annotationName = annotation.substringAfterLast('.')
+            sources.keys.filterTo(setWideDependencies) { sources.getValue(it).contains(annotationName) }
+        }
+        sources.keys.filterTo(setWideDependencies) { it.endsWith(".kt") || it.endsWith(".kts") }
+        val cacheInputs = HashMap<String, String>()
+        if (cacheDir != null && cacheKey != null) {
+            for ((name, text) in sources) {
+                val input = StringBuilder(text)
+                if ('@' in text) {
+                    MIXIN_TARGET.findAll(text).mapNotNull { sourceClassByName[it.groupValues[1]] }
+                        .filter { it != name }
+                        .distinct()
+                        .forEach { input.append('\u0000').append(it).append('\u0000').append(sources.getValue(it)) }
+                }
+                setWideDependencies.forEach { dependency ->
+                    if (dependency != name) {
+                        input.append('\u0000').append(dependency).append('\u0000').append(sources.getValue(dependency))
+                    }
+                }
+                cacheInputs[name] = input.toString()
+            }
+            if (cacheInputs.all { (name, input) -> cacheFileFor(cacheDir, cacheKey, name, input).isFile }) {
+                return cacheInputs.mapValues { (name, input) ->
+                    cacheFileFor(cacheDir, cacheKey, name, input).readText() to emptyList<Pair<Int, String>>()
+                }
+            }
+        }
         val tmpDir = if (physicalSourceFiles == null) Files.createTempDirectory("remap") else null
         val processedTmpDir = if (manageImports) Files.createTempDirectory("remap-processed") else null  // fallen's fork: optimize skip unused processed temp root
         val disposable = Disposer.newDisposable()
         try {
             if (physicalSourceFiles == null) {  // fallen's fork: optimize use physical source roots for PSI - warp with if
-                for ((unitName, source) in sources) {
-                    val path = tmpDir!!.resolve(unitName)
-                    Files.createDirectories(path.parent)
-                    Files.write(path, source.toByteArray(StandardCharsets.UTF_8), StandardOpenOption.CREATE)
-
-                    // fallen's fork: optimize skip unused processed temp root - begin
-                    processedTmpDir?.let { processedRoot ->
+                // Directories repeat across the source set, so create each once up front; the per-file syscall
+                // sequence is what dominates this stage on every version node. The files themselves are
+                // independent, so write them in parallel.
+                psiSources.keys.mapNotNull { tmpDir!!.resolve(it).parent }.toHashSet().forEach { Files.createDirectories(it) }
+                val processedRoot = processedTmpDir
+                if (processedRoot != null) {
+                    psiSources.keys.mapNotNull { processedRoot.resolve(it).parent }.toHashSet().forEach { Files.createDirectories(it) }
+                }
+                psiSources.entries.parallelStream().forEach { (unitName, source) ->
+                    Files.write(tmpDir!!.resolve(unitName), source.toByteArray(StandardCharsets.UTF_8), StandardOpenOption.CREATE)
+                    // fallen's fork: optimize skip unused processed temp root
+                    processedRoot?.let { it2 ->
                         val processedSource = processedSources[unitName] ?: source
-                        val processedPath = processedRoot.resolve(unitName)
-                        Files.createDirectories(processedPath.parent)
-                        Files.write(processedPath, processedSource.toByteArray(), StandardOpenOption.CREATE)
+                        Files.write(it2.resolve(unitName), processedSource.toByteArray(), StandardOpenOption.CREATE)
                     }
-                    // fallen's fork: optimize skip unused processed temp root - end
                 }
             } else {
                 // fallen's fork: optimize skip unused processed temp root - begin
@@ -168,11 +252,15 @@ class Transformer(private val map: MappingSet) {
             } else {
                 vfs.findFileByIoFile(physicalSourceFiles.getValue(name).file)!!
             }
-            val virtualFiles = sources.mapValues { findSourceFile(it.key) }
             // fallen's fork: optimize use physical source roots for PSI - end
 
-            val psiFiles = virtualFiles.mapValues { psiManager.findFile(it.value)!! }
-            val ktFiles = psiFiles.values.filterIsInstance<KtFile>()
+            // The per-file loop below resolves its own PSI tree lazily, and skips that entirely on a cache hit,
+            // so the only consumer of a fully materialised PSI map is the Kotlin list handed to the analysis.
+            // Resolve just the Kotlin sources: a Java-only source set stops paying for a PSI tree of every
+            // source on every version node.
+            val ktFiles = sources.keys
+                .filter { it.endsWith(".kt") || it.endsWith(".kts") }
+                .mapNotNull { psiManager.findFile(findSourceFile(it)) as? KtFile }
 
             val analysis = try {
                 analyze1521(environment, ktFiles)
@@ -210,13 +298,26 @@ class Transformer(private val map: MappingSet) {
                 null
             }
 
+            // One cache for the whole run: the target-side lookup behind `resolvesOnTarget` is a global index
+            // query and the same (owner, method) pair recurs across files, so per-file state would redo it.
+            val resolvesCache = HashMap<Pair<String, String>, Boolean>()
             val results = HashMap<String, Pair<String, List<Pair<Int, String>>>>()
-            for (name in sources.keys) {
+            for (name in psiSources.keys) {
+                val cacheFile = if (cacheDir != null && cacheKey != null) {
+                    cacheFileFor(cacheDir, cacheKey, name, cacheInputs.getValue(name))
+                } else {
+                    null
+                }
+                if (cacheFile != null && cacheFile.isFile) {
+                    results[name] = cacheFile.readText() to emptyList()
+                    continue
+                }
+
                 val file = findSourceFile(name)
                 val psiFile = psiManager.findFile(file)!!
 
                 var (text, errors) = try {
-                    PsiMapper(map, remappedEnv?.project, psiFile, analysis.bindingContext, patterns).remapFile()
+                    PsiMapper(map, remappedEnv?.project, psiFile, analysis.bindingContext, patterns, resolvesCache).remapFile()
                 } catch (e: Exception) {
                     throw RuntimeException("Failed to map file \"$name\".", e)
                 }
@@ -227,6 +328,14 @@ class Transformer(private val map: MappingSet) {
                 }
 
                 results[name] = text to errors
+                // Only a clean result is cached: errors carry line numbers the caller reports, and reusing a
+                // cached text without them would silently drop diagnostics.
+                if (cacheFile != null && errors.isEmpty()) {
+                    runCatching {
+                        cacheFile.parentFile?.mkdirs()
+                        cacheFile.writeText(text)
+                    }
+                }
             }
             return results
         } finally {
@@ -243,6 +352,21 @@ class Transformer(private val map: MappingSet) {
             // fallen's fork: optimize skip unused processed temp root - end
             Disposer.dispose(disposable)
         }
+    }
+
+    /**
+     * Cache path for one file's rewritten text. The key covers the mapping, the file's logical path and its
+     * input text, so a change to any of them lands on a different entry.
+     */
+    private fun cacheFileFor(dir: File, mappingKey: String, name: String, sourceText: String): File {
+        val digest = java.security.MessageDigest.getInstance("MD5")
+        digest.update(mappingKey.toByteArray(Charsets.UTF_8))
+        digest.update(0)
+        digest.update(name.toByteArray(Charsets.UTF_8))
+        digest.update(0)
+        digest.update(sourceText.toByteArray(Charsets.UTF_8))
+        val hex = digest.digest().joinToString("") { "%02x".format(it) }
+        return File(File(dir, hex.substring(0, 2)), "$hex.txt")
     }
 
     private fun CompilerConfiguration.setupJdk(jdkHome: File) {

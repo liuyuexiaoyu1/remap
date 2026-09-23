@@ -44,7 +44,13 @@ internal class PsiMapper(
         private val remappedProject: Project?,
         private val file: PsiFile,
         private val bindingContext: BindingContext,
-        private val patterns: PsiPatterns?
+        private val patterns: PsiPatterns?,
+        /**
+         * Shared across every file of one remap run. The target-side lookup behind [resolvesOnTarget] is a
+         * global index query, and the same `(owner, method name)` pair recurs across files, so per-file state
+         * would redo it hundreds of times.
+         */
+        private val resolvesCache: MutableMap<Pair<String, String>, Boolean>,
 ) {
     private var mixinTarget: PsiClass? = null
     private val mixinTargets = mutableMapOf<String, PsiClass>()
@@ -393,9 +399,12 @@ internal class PsiMapper(
     private fun resolvesOnTarget(method: PsiMethod): Boolean {
         val project = remappedProject ?: return false
         val owner = method.containingClass?.qualifiedName ?: return false
-        val targetClass = JavaPsiFacade.getInstance(project).findClass(owner, GlobalSearchScope.allScope(project))
-            ?: return false
-        return targetClass.findMethodsByName(method.name, true).isNotEmpty()
+        return resolvesCache.getOrPut(owner to method.name) {
+            val targetClass = JavaPsiFacade.getInstance(project)
+                .findClass(owner, GlobalSearchScope.allScope(project))
+                ?: return@getOrPut false
+            targetClass.findMethodsByName(method.name, true).isNotEmpty()
+        }
     }
 
     private fun findExactMapping(declaringClass: PsiClass, name: String, desc: String): MethodMapping? {
@@ -623,9 +632,12 @@ internal class PsiMapper(
                             targetMethods.find { it.desc == targetDesc }
                         } else {
                             if (targetMethods.size > 1) {
-                                error(literalExpr,
-                                    "Ambiguous mixin method \"$targetName\" may refer to any of: " +
-                                            targetMethods.joinToString { "\"${it.name}${it.desc}\"" })
+                                // A bare name matching several overloads cannot be resolved, but it does not
+                                // need to be: the mapping renames a method as a whole, so every overload keeps
+                                // the name written here and there is nothing to rewrite. Reporting this as an
+                                // error made a directive that deliberately narrows a name for its own version
+                                // - which is exactly what a trailing //#replace does - fail to preprocess.
+                                continue
                             }
                             targetMethods.firstOrNull()
                         }
